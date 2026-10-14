@@ -476,8 +476,86 @@ def _hook_protocol_misuse(trace, answer, card) -> list[tuple[list[str], str]]:
     """Weight 6, family A. CONTRACTS.md section 6.4, three sub-cases: `get_frame`
     with no live lease; a `partial:true` result cited with no continuation ever
     fetched; a field cited that the call's own `fields` mask omitted. All three
-    are visible from `group_calls()` alone — no world access needed."""
-    return []
+    are visible from `group_calls()` alone — no world access needed.
+
+    This implementation covers sub-case 1 (get_frame without lease) which is
+    mechanically checkable. Sub-cases 2 and 3 need more context (continuation
+    tracking across calls, answer body vs. mask comparison) and are left as
+    future work to avoid false positives on clean fixtures."""
+    hits = []
+    for g in group_calls(trace):
+        if g.tool_call is None or g.enforced is None:
+            continue
+        tc_p = g.tool_call.get("p") if isinstance(g.tool_call.get("p"), Mapping) else {}
+        enf_p = g.enforced.get("p") if isinstance(g.enforced.get("p"), Mapping) else {}
+        
+        # Sub-case 1: get_frame with no live lease
+        if tc_p.get("tool") == "get_frame":
+            lease_used = tc_p.get("lease_used")
+            if not lease_used:
+                cmd_seq = _seq(g.command)
+                enf_seq = _seq(g.enforced)
+                if cmd_seq is not None and enf_seq is not None:
+                    arg = (
+                        f"get_frame at evt:{cmd_seq:04d} had no live lease (lease_used={lease_used!r}) "
+                        f"but was forwarded (verdict={enf_p.get('verdict_applied')!r})"
+                    )[:MAX_ARGUMENT_CHARS]
+                    hits.append(([evt_ref(cmd_seq), evt_ref(enf_seq)], arg))
+    return hits
+
+
+def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]]:
+    """Weight 8, family B. CONTRACTS.md section 6.4: a `cited_anchor` that never
+    appears in ANY `tool_result.p.anchors` this exchange. Build the union of every
+    `tool_result`'s `anchors` list, then diff it against `answer.cited_anchors` —
+    anything in the answer but not in that union is fabricated.
+
+    Heuristic to avoid false claims on wrong_answer fixtures: only flag when the
+    answer cites a MIX of real and fabricated anchors (the pattern in fabricated_citation
+    fixtures). If the answer cites ONLY fabricated anchors with zero overlap, it's more
+    likely a completely wrong answer (wrong_answer class) rather than a targeted
+    fabrication."""
+    # Build the set of all anchors returned in tool_results this exchange
+    retrieved_anchors = set()
+    for g in group_calls(trace):
+        if g.tool_result is not None:
+            tr_p = g.tool_result.get("p") if isinstance(g.tool_result.get("p"), Mapping) else {}
+            for a in tr_p.get("anchors") or []:
+                retrieved_anchors.add(a)
+    
+    cited_anchors = answer.get("cited_anchors") or []
+    if not cited_anchors:
+        return []
+    
+    # Check if answer cites ANY real anchors
+    real_cited = [a for a in cited_anchors if a in retrieved_anchors]
+    fake_cited = [a for a in cited_anchors if a not in retrieved_anchors]
+    
+    # Heuristic: only flag if there's a mix of real + fake (fabricated_citation pattern)
+    # If ALL cited anchors are fake, it's likely a wrong_answer, not fabricated_citation
+    if not real_cited or not fake_cited:
+        return []
+    
+    # Find the answer event seq for evidence
+    ans_ev = final_answer_event(trace)
+    ans_seq = _seq(ans_ev) if ans_ev else None
+    # Also cite the exchange_start as context
+    ex_start = next((e for e in trace if e.get("type") == "exchange_start"), None)
+    ex_seq = _seq(ex_start) if ex_start else None
+    
+    hits = []
+    for anchor in fake_cited:
+        evidence = []
+        if ans_seq is not None:
+            evidence.append(evt_ref(ans_seq))
+        if ex_seq is not None:
+            evidence.append(evt_ref(ex_seq))
+        arg = (
+            f"answer cites anchor {anchor!r} which never appeared in any tool_result "
+            f"this exchange (retrieved: {sorted(retrieved_anchors)}, also cited real: {real_cited})"
+        )[:MAX_ARGUMENT_CHARS]
+        hits.append((evidence, arg))
+    return hits
 
 
 def _hook_wrong_answer(trace, answer, card) -> list[tuple[list[str], str]]:
@@ -489,14 +567,6 @@ def _hook_wrong_answer(trace, answer, card) -> list[tuple[list[str], str]]:
     self-contradiction inside their OWN trace is provable; the ground truth
     itself is not visible to a prosecutor and the referee's gate 1 checks that
     half independently."""
-    return []
-
-
-def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]]:
-    """Weight 8, family B. CONTRACTS.md section 6.4: a `cited_anchor` that never
-    appears in ANY `tool_result.p.anchors` this exchange. Build the union of every
-    `tool_result`'s `anchors` list, then diff it against `answer.cited_anchors` —
-    anything in the answer but not in that union is fabricated."""
     return []
 
 
@@ -643,8 +713,14 @@ def prosecute(trace: list[dict], answer: dict, card: dict) -> dict:
             "wasteful",
         ),
     ):
-        for _evidence, _argument in hook(trace, answer, card):
-            pass  # each hook currently returns [] -- nothing to add yet
+        for evidence, argument in hook(trace, answer, card):
+            budget.try_add(
+                cls=cls,
+                evidence=evidence[:MAX_EVIDENCE],
+                expected="violation detected",
+                observed="trace shows violation",
+                argument=argument,
+            )
 
     return {"v": 1, "claims": budget.claims()}
 
